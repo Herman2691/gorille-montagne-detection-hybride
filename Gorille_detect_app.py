@@ -30,16 +30,78 @@ FILE_ID    = "1ojLIeI5Qbq1w0bSnaQm4YwJOzkdd2bUy"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _download_from_drive(file_id: str, dest: str) -> bool:
+    """
+    Télécharge un fichier depuis Google Drive en contournant la page
+    de confirmation antivirus (fichiers > 100 Mo).
+    Stratégie : requests avec gestion du cookie de confirmation.
+    """
+    import requests
+
+    session = requests.Session()
+
+    # 1re requête — récupère le cookie de confirmation si besoin
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    resp = session.get(url, stream=True, timeout=30)
+
+    # Cherche le token de confirmation dans les cookies ou dans le HTML
+    token = None
+    for key, val in resp.cookies.items():
+        if key.startswith("download_warning"):
+            token = val
+            break
+
+    if token is None:
+        # Google Drive peut maintenant renvoyer un formulaire HTML
+        import re
+        match = re.search(r'confirm=([0-9A-Za-z_\-]+)', resp.text)
+        if match:
+            token = match.group(1)
+
+    if token:
+        url = (
+            f"https://drive.google.com/uc?export=download"
+            f"&confirm={token}&id={file_id}"
+        )
+        resp = session.get(url, stream=True, timeout=120)
+
+    # Vérifie que c'est bien un fichier binaire (pas une page HTML d'erreur)
+    content_type = resp.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        # Dernière tentative avec l'API export drive
+        url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+        resp = session.get(url, stream=True, timeout=120)
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" in content_type:
+            return False
+
+    # Écriture sur disque par blocs
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=32768):
+            if chunk:
+                f.write(chunk)
+
+    # Sanity-check : un .pt valide fait au moins quelques Ko
+    return os.path.exists(dest) and os.path.getsize(dest) > 10_000
+
+
 @st.cache_resource(show_spinner="⏳ Téléchargement et chargement du modèle…")
 def load_model():
     """Télécharge le modèle depuis Google Drive si absent, puis le charge."""
     if not os.path.exists(MODEL_PATH):
-        import gdown
-        url = f"https://drive.google.com/uc?id={FILE_ID}"
-        gdown.download(url, MODEL_PATH, quiet=False)
+        st.info("📥 Téléchargement du modèle depuis Google Drive…")
+        ok = _download_from_drive(FILE_ID, MODEL_PATH)
+        if not ok:
+            # Nettoyage d'un éventuel fichier HTML corrompu
+            if os.path.exists(MODEL_PATH):
+                os.remove(MODEL_PATH)
 
     if not os.path.exists(MODEL_PATH):
-        st.error("❌ Téléchargement du modèle échoué. Vérifiez le FILE_ID ou les permissions Drive.")
+        st.error(
+            "❌ Téléchargement échoué. Vérifiez que :\n"
+            "1. Le fichier Drive est partagé **« Tout le monde avec le lien »**\n"
+            f"2. Le FILE_ID est correct : `{FILE_ID}`"
+        )
         return None
 
     try:
